@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998, 2011, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1998, 2013, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -36,23 +36,24 @@
 #include "runtime/osThread.hpp"
 #include "runtime/stubRoutines.hpp"
 #include "runtime/synchronizer.hpp"
+#include "runtime/thread.inline.hpp"
 #include "utilities/dtrace.hpp"
 #include "utilities/events.hpp"
 #include "utilities/preserveException.hpp"
 #ifdef TARGET_OS_FAMILY_linux
 # include "os_linux.inline.hpp"
-# include "thread_linux.inline.hpp"
 #endif
 #ifdef TARGET_OS_FAMILY_solaris
 # include "os_solaris.inline.hpp"
-# include "thread_solaris.inline.hpp"
 #endif
 #ifdef TARGET_OS_FAMILY_windows
 # include "os_windows.inline.hpp"
-# include "thread_windows.inline.hpp"
+#endif
+#ifdef TARGET_OS_FAMILY_bsd
+# include "os_bsd.inline.hpp"
 #endif
 
-#if defined(__GNUC__) && !defined(IA64)
+#if defined(__GNUC__)
   // Need to inhibit inlining for older versions of GCC to avoid build-time failures
   #define ATTR __attribute__((noinline))
 #else
@@ -73,43 +74,67 @@
 // Only bother with this argument setup if dtrace is available
 // TODO-FIXME: probes should not fire when caller is _blocked.  assert() accordingly.
 
-HS_DTRACE_PROBE_DECL5(hotspot, monitor__wait,
-  jlong, uintptr_t, char*, int, long);
-HS_DTRACE_PROBE_DECL4(hotspot, monitor__waited,
-  jlong, uintptr_t, char*, int);
-
-#define DTRACE_MONITOR_PROBE_COMMON(klassOop, thread)                      \
+#define DTRACE_MONITOR_PROBE_COMMON(obj, thread)                           \
   char* bytes = NULL;                                                      \
   int len = 0;                                                             \
   jlong jtid = SharedRuntime::get_java_tid(thread);                        \
-  Symbol* klassname = ((oop)(klassOop))->klass()->klass_part()->name();  \
+  Symbol* klassname = ((oop)(obj))->klass()->name();                       \
   if (klassname != NULL) {                                                 \
     bytes = (char*)klassname->bytes();                                     \
     len = klassname->utf8_length();                                        \
   }
 
-#define DTRACE_MONITOR_WAIT_PROBE(monitor, klassOop, thread, millis)       \
+#ifndef USDT2
+HS_DTRACE_PROBE_DECL5(hotspot, monitor__wait,
+  jlong, uintptr_t, char*, int, long);
+HS_DTRACE_PROBE_DECL4(hotspot, monitor__waited,
+  jlong, uintptr_t, char*, int);
+
+#define DTRACE_MONITOR_WAIT_PROBE(monitor, obj, thread, millis)            \
   {                                                                        \
     if (DTraceMonitorProbes) {                                            \
-      DTRACE_MONITOR_PROBE_COMMON(klassOop, thread);                       \
+      DTRACE_MONITOR_PROBE_COMMON(obj, thread);                            \
       HS_DTRACE_PROBE5(hotspot, monitor__wait, jtid,                       \
                        (monitor), bytes, len, (millis));                   \
     }                                                                      \
   }
 
-#define DTRACE_MONITOR_PROBE(probe, monitor, klassOop, thread)             \
+#define DTRACE_MONITOR_PROBE(probe, monitor, obj, thread)                  \
   {                                                                        \
     if (DTraceMonitorProbes) {                                            \
-      DTRACE_MONITOR_PROBE_COMMON(klassOop, thread);                       \
+      DTRACE_MONITOR_PROBE_COMMON(obj, thread);                            \
       HS_DTRACE_PROBE4(hotspot, monitor__##probe, jtid,                    \
                        (uintptr_t)(monitor), bytes, len);                  \
     }                                                                      \
   }
 
+#else /* USDT2 */
+
+#define DTRACE_MONITOR_WAIT_PROBE(monitor, obj, thread, millis)            \
+  {                                                                        \
+    if (DTraceMonitorProbes) {                                            \
+      DTRACE_MONITOR_PROBE_COMMON(obj, thread);                            \
+      HOTSPOT_MONITOR_WAIT(jtid,                                           \
+                           (uintptr_t)(monitor), bytes, len, (millis));  \
+    }                                                                      \
+  }
+
+#define HOTSPOT_MONITOR_PROBE_waited HOTSPOT_MONITOR_PROBE_WAITED
+
+#define DTRACE_MONITOR_PROBE(probe, monitor, obj, thread)                  \
+  {                                                                        \
+    if (DTraceMonitorProbes) {                                            \
+      DTRACE_MONITOR_PROBE_COMMON(obj, thread);                            \
+      HOTSPOT_MONITOR_PROBE_##probe(jtid, /* probe = waited */             \
+                       (uintptr_t)(monitor), bytes, len);                  \
+    }                                                                      \
+  }
+
+#endif /* USDT2 */
 #else //  ndef DTRACE_ENABLED
 
-#define DTRACE_MONITOR_WAIT_PROBE(klassOop, thread, millis, mon)    {;}
-#define DTRACE_MONITOR_PROBE(probe, klassOop, thread, mon)          {;}
+#define DTRACE_MONITOR_WAIT_PROBE(obj, thread, millis, mon)    {;}
+#define DTRACE_MONITOR_PROBE(probe, obj, thread, mon)          {;}
 
 #endif // ndef DTRACE_ENABLED
 
@@ -129,18 +154,24 @@ int ObjectSynchronizer::gOmInUseCount = 0;
 static volatile intptr_t ListLock = 0 ;      // protects global monitor free-list cache
 static volatile int MonitorFreeCount  = 0 ;      // # on gFreeList
 static volatile int MonitorPopulation = 0 ;      // # Extant -- in circulation
-#define CHAINMARKER ((oop)-1)
+#define CHAINMARKER (cast_to_oop<intptr_t>(-1))
 
 // -----------------------------------------------------------------------------
-// Fast Monitor Enter/Exit
-// This the fast monitor enter. The interpreter and compiler use some assembly copies of this code.
-// Make sure update those code if the following function is changed.  The implementation is extremely sensitive to race condition. Be careful.
-//
-//
+//  Fast Monitor Enter/Exit
+// This the fast monitor enter. The interpreter and compiler use
+// some assembly copies of this code. Make sure update those code
+// if the following function is changed. The implementation is
+// extremely sensitive to race condition. Be careful.
 
 void ObjectSynchronizer::fast_enter(Handle obj, BasicLock* lock, bool attempt_rebias, TRAPS) {
+// 1.根据jvm参数判断是否开启偏向锁
  if (UseBiasedLocking) {
-    if (!SafepointSynchronize::is_at_safepoint()) {//检测是否在安全点
+    //2.判断是否在安全点 (All Java threads are stopped at a safepoint. Only VM thread is running)
+    //这里的代码是给当前线程设置偏向锁，所以这个操作肯定不能在安全点时操作
+    if (!SafepointSynchronize::is_at_safepoint()) {
+      //3.尝试撤销偏向状态并重新偏向（这里我理解撤销偏向的操作就是把把对象头中的threadID和epoch，还原为原始的hashCode）
+      //进行重新偏向的操作就是 把对象头中的hashcode，通过CAS设置为当前对象的threadID。
+      //所以我理解这里CAS的判断条件就是当markword为hashcode时(表示没有对象抢占偏向锁)，把markword替换为当前的线程ID
       BiasedLocking::Condition cond = BiasedLocking::revoke_and_rebias(obj, attempt_rebias, THREAD);
       if (cond == BiasedLocking::BIAS_REVOKED_AND_REBIASED) {
         return;
@@ -151,7 +182,7 @@ void ObjectSynchronizer::fast_enter(Handle obj, BasicLock* lock, bool attempt_re
     }
     assert(!obj->mark()->has_bias_pattern(), "biases should be revoked by now");
  }
- //不能偏向，就获取轻量级锁
+
  slow_enter (obj, lock, THREAD) ;
 }
 
@@ -188,28 +219,28 @@ void ObjectSynchronizer::fast_exit(oop object, BasicLock* lock, TRAPS) {
      }
   }
 
-  ObjectSynchronizer::inflate(THREAD, object)->exit (THREAD) ;
+  ObjectSynchronizer::inflate(THREAD, object)->exit (true, THREAD) ;
 }
 
 // -----------------------------------------------------------------------------
-// Interpreter/Compiler Slow Case This routine is used to handle interpreter/compiler slow case We don't need to use fast path here
-// because it must have been failed in the interpreter/compiler code.
-//
-//
+// Interpreter/Compiler Slow Case
+// This routine is used to handle interpreter/compiler slow case
+// We don't need to use fast path here, because it must have been
+// failed in the interpreter/compiler code.
 void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS) {
   markOop mark = obj->mark();
   assert(!mark->has_bias_pattern(), "should not see bias pattern here");
 
-  if (mark->is_neutral()) {//如果是无锁状态
+  if (mark->is_neutral()) {
     // Anticipate successful CAS -- the ST of the displaced mark must
     // be visible <= the ST performed by the CAS.
-    lock->set_displaced_header(mark);//
+    lock->set_displaced_header(mark);
     if (mark == (markOop) Atomic::cmpxchg_ptr(lock, obj()->mark_addr(), mark)) {
       TEVENT (slow_enter: release stacklock) ;
       return ;
     }
     // Fall through to inflate() ...
-  } else  //如果是轻量级锁检测是否是当前线程获取对应的锁
+  } else
   if (mark->has_locker() && THREAD->is_lock_owned((address)mark->locker())) {
     assert(lock != mark->locker(), "must not re-lock the same lock");
     assert(lock != (BasicLock*)obj->mark(), "don't relock with same BasicLock");
@@ -225,12 +256,12 @@ void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS) {
   }
 #endif
 
-  // The object header will never be displaced to this lock,so it does not matter what the value is,
-  // except that it must be non-zero to avoid looking like a re-entrant lock,and must not look locked either.
-  // 这个锁的对象头永远不会被取代
-  //
+  // The object header will never be displaced to this lock,
+  // so it does not matter what the value is, except that it
+  // must be non-zero to avoid looking like a re-entrant lock,
+  // and must not look locked either.
   lock->set_displaced_header(markOopDesc::unused_mark());
-  ObjectSynchronizer::inflate(THREAD, obj())->enter(THREAD);//进行锁膨胀
+  ObjectSynchronizer::inflate(THREAD, obj())->enter(THREAD);
 }
 
 // This routine is used to handle interpreter/compiler slow case
@@ -308,7 +339,9 @@ bool ObjectSynchronizer::jni_try_enter(Handle obj, Thread* THREAD) {
 void ObjectSynchronizer::jni_exit(oop obj, Thread* THREAD) {
   TEVENT (jni_exit) ;
   if (UseBiasedLocking) {
-    BiasedLocking::revoke_and_rebias(obj, false, THREAD);
+    Handle h_obj(THREAD, obj);
+    BiasedLocking::revoke_and_rebias(h_obj, false, THREAD);
+    obj = h_obj();
   }
   assert(!obj->mark()->has_bias_pattern(), "biases should be revoked by now");
 
@@ -316,7 +349,7 @@ void ObjectSynchronizer::jni_exit(oop obj, Thread* THREAD) {
   // If this thread has locked the object, exit the monitor.  Note:  can't use
   // monitor->check(CHECK); must exit even if an exception is pending.
   if (monitor->check(THREAD)) {
-     monitor->exit(THREAD);
+     monitor->exit(true, THREAD);
   }
 }
 
@@ -422,8 +455,6 @@ void ObjectSynchronizer::notifyall(Handle obj, TRAPS) {
 // and explicit fences (barriers) to control for architectural reordering performed
 // by the CPU(s) or platform.
 
-static int  MBFence (int x) { OrderAccess::fence(); return x; }
-
 struct SharedGlobals {
     // These are highly shared mostly-read variables.
     // To avoid false-sharing they need to be the sole occupants of a $ line.
@@ -442,8 +473,8 @@ static int MonitorScavengeThreshold = 1000000 ;
 static volatile int ForceMonitorScavenge = 0 ; // Scavenge required and pending
 
 static markOop ReadStableMark (oop obj) {
-  markOop mark = obj->mark() ;//获取对象头
-  if (!mark->is_being_inflated()) {//如果锁没有进行膨胀 直接返回
+  markOop mark = obj->mark() ;
+  if (!mark->is_being_inflated()) {
     return mark ;       // normal fast-path return
   }
 
@@ -485,7 +516,7 @@ static markOop ReadStableMark (oop obj) {
          // then for each thread on the list, set the flag and unpark() the thread.
          // This is conceptually similar to muxAcquire-muxRelease, except that muxRelease
          // wakes at most one thread whereas we need to wake the entire list.
-         int ix = (intptr_t(obj) >> 5) & (NINFLATIONLOCKS-1) ;
+         int ix = (cast_from_oop<intptr_t>(obj) >> 5) & (NINFLATIONLOCKS-1) ;
          int YieldThenBlock = 0 ;
          assert (ix >= 0 && ix < NINFLATIONLOCKS, "invariant") ;
          assert ((NINFLATIONLOCKS & (NINFLATIONLOCKS-1)) == 0, "invariant") ;
@@ -540,7 +571,7 @@ static inline intptr_t get_next_hash(Thread * Self, oop obj) {
      // This variation has the property of being stable (idempotent)
      // between STW operations.  This can be useful in some of the 1-0
      // synchronization schemes.
-     intptr_t addrBits = intptr_t(obj) >> 3 ;
+     intptr_t addrBits = cast_from_oop<intptr_t>(obj) >> 3 ;
      value = addrBits ^ (addrBits >> 5) ^ GVars.stwRandom ;
   } else
   if (hashCode == 2) {
@@ -550,7 +581,7 @@ static inline intptr_t get_next_hash(Thread * Self, oop obj) {
      value = ++GVars.hcSequence ;
   } else
   if (hashCode == 4) {
-     value = intptr_t(obj) ;
+     value = cast_from_oop<intptr_t>(obj) ;
   } else {
      // Marsaglia's xor-shift scheme with thread-specific state
      // This is probably the best overall implementation -- we'll
@@ -786,6 +817,7 @@ JavaThread* ObjectSynchronizer::get_lock_owner(Handle h_obj, bool doLock) {
   }
 
   if (owner != NULL) {
+    // owning_thread_from_monitor_owner() may also return NULL here
     return Threads::owning_thread_from_monitor_owner(owner, doLock);
   }
 
@@ -992,7 +1024,8 @@ ObjectMonitor * ATTR ObjectSynchronizer::omAlloc (Thread * Self) {
         // We might be able to induce a STW safepoint and scavenge enough
         // objectMonitors to permit progress.
         if (temp == NULL) {
-            vm_exit_out_of_memory (sizeof (ObjectMonitor[_BLOCKSIZE]), "Allocate ObjectMonitors") ;
+            vm_exit_out_of_memory (sizeof (ObjectMonitor[_BLOCKSIZE]), OOM_MALLOC_ERROR,
+                                   "Allocate ObjectMonitors");
         }
 
         // Format the block.
@@ -1169,35 +1202,35 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
           !SafepointSynchronize::is_at_safepoint(), "invariant") ;
 
   for (;;) {
-      const markOop mark = object->mark() ;//获取对象头
-      assert (!mark->has_bias_pattern(), "invariant") ;//
+      const markOop mark = object->mark() ;
+      assert (!mark->has_bias_pattern(), "invariant") ;
 
-           //Mark Word可能有以下几种状态:
-           // *  Inflated(膨胀完成)     - just return
-           // *  Stack-locked(轻量级锁) - coerce it to inflated
-           // *  INFLATING(膨胀中)     - busy wait for conversion to complete
-           // *  Neutral(无锁)        - aggressively inflate the object.
-           // *  BIASED(偏向锁)       - Illegal.  We should never see this
+      // The mark can be in one of the following states:
+      // *  Inflated     - just return
+      // *  Stack-locked - coerce it to inflated
+      // *  INFLATING    - busy wait for conversion to complete
+      // *  Neutral      - aggressively inflate the object.
+      // *  BIASED       - Illegal.  We should never see this
 
-      // 如果当前状态已经是重量级锁，就通过mark->monitor()方法取得ObjectMonitor指针再返回
+      // CASE: inflated
       if (mark->has_monitor()) {
-          ObjectMonitor * inf = mark->monitor() ;//获取对象监视器
+          ObjectMonitor * inf = mark->monitor() ;
           assert (inf->header()->is_neutral(), "invariant");
           assert (inf->object() == object, "invariant") ;
           assert (ObjectSynchronizer::verify_objmon_isinpool(inf), "monitor is invalid");
           return inf ;
       }
 
-      // CASE: inflation in progress - inflating over a stack-lock.Some other thread is converting from stack-locked to inflated.
-      // Only that thread can complete inflation -- other threads must wait.The INFLATING value is transient.
-      // Currently, we spin/yield/park and poll the markword, waiting for inflation to finish.We could always eliminate polling by parking the thread on some auxiliary list.
-      // 如果是膨胀中，就调用ReadStableMark方法进行等待
-      // ReadStableMark方法执行完毕后再通过continue继续检查，ReadStableMark方法中还会调用os::NakedYield()释放CPU资源
-      //
-      if (mark == markOopDesc::INFLATING()) {//判断是否在膨胀
+      // CASE: inflation in progress - inflating over a stack-lock.
+      // Some other thread is converting from stack-locked to inflated.
+      // Only that thread can complete inflation -- other threads must wait.
+      // The INFLATING value is transient.
+      // Currently, we spin/yield/park and poll the markword, waiting for inflation to finish.
+      // We could always eliminate polling by parking the thread on some auxiliary list.
+      if (mark == markOopDesc::INFLATING()) {
          TEVENT (Inflate: spin while INFLATING) ;
          ReadStableMark(object) ;
-         continue ; //如果正在膨胀，自旋等待膨胀完成
+         continue ;
       }
 
       // CASE: stack-locked
@@ -1219,8 +1252,8 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
       // before or after the CAS(INFLATING) operation.
       // See the comments in omAlloc().
 
-      if (mark->has_locker()) { //如果当前是轻量级锁
-          ObjectMonitor * m = omAlloc (Self) ;//返回一个对象的内置ObjectMonitor对象
+      if (mark->has_locker()) {
+          ObjectMonitor * m = omAlloc (Self) ;
           // Optimistically prepare the objectmonitor - anticipate successful CAS
           // We do this before the CAS in order to minimize the length of time
           // in which INFLATING appears in the mark.
@@ -1228,12 +1261,12 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
           m->_Responsible  = NULL ;
           m->OwnerIsThread = 0 ;
           m->_recursions   = 0 ;
-          m->_SpinDuration = ObjectMonitor::Knob_SpinLimit ;   //设置自旋获取重量级锁的次数 默认值是5000
-          //CAS操作标识Mark Word正在膨胀
+          m->_SpinDuration = ObjectMonitor::Knob_SpinLimit ;   // Consider: maintain by type/class
+
           markOop cmp = (markOop) Atomic::cmpxchg_ptr (markOopDesc::INFLATING(), object->mark_addr(), mark) ;
           if (cmp != mark) {
              omRelease (Self, m, true) ;
-             continue ;       //如果上述CAS操作失败，自旋等待膨胀完成
+             continue ;       // Interference -- just retry
           }
 
           // We've successfully installed INFLATING (0) into the mark-word.
@@ -1277,14 +1310,14 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
           // m->OwnerIsThread = 1. Note that a thread can inflate an object
           // that it has stack-locked -- as might happen in wait() -- directly
           // with CAS.  That is, we can avoid the xchg-NULL .... ST idiom.
-          m->set_owner(mark->locker());//设置ObjectMonitor的_owner为拥有对象轻量级锁的线程
+          m->set_owner(mark->locker());
           m->set_object(object);
           // TODO-FIXME: assert BasicLock->dhw != 0.
 
-          // Must preserve store ordering. The monitor state must be stable at the time of publishing the monitor address.
-          //
+          // Must preserve store ordering. The monitor state must
+          // be stable at the time of publishing the monitor address.
           guarantee (object->mark() == markOopDesc::INFLATING(), "invariant") ;
-          object->release_set_mark(markOopDesc::encode(m));/
+          object->release_set_mark(markOopDesc::encode(m));
 
           // Hopefully the performance counters are allocated on distinct cache lines
           // to avoid false sharing on MP systems ...
@@ -1294,8 +1327,8 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
             if (object->is_instance()) {
               ResourceMark rm;
               tty->print_cr("Inflating object " INTPTR_FORMAT " , mark " INTPTR_FORMAT " , type %s",
-                (intptr_t) object, (intptr_t) object->mark(),
-                Klass::cast(object->klass())->external_name());
+                (void *) object, (intptr_t) object->mark(),
+                object->klass()->external_name());
             }
           }
           return m ;
@@ -1344,8 +1377,8 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self, oop object) {
         if (object->is_instance()) {
           ResourceMark rm;
           tty->print_cr("Inflating object " INTPTR_FORMAT " , mark " INTPTR_FORMAT " , type %s",
-            (intptr_t) object, (intptr_t) object->mark(),
-            Klass::cast(object->klass())->external_name());
+            (void *) object, (intptr_t) object->mark(),
+            object->klass()->external_name());
         }
       }
       return m ;
@@ -1412,7 +1445,7 @@ bool ObjectSynchronizer::deflate_monitor(ObjectMonitor* mid, oop obj,
        if (obj->is_instance()) {
          ResourceMark rm;
            tty->print_cr("Deflating object " INTPTR_FORMAT " , mark " INTPTR_FORMAT " , type %s",
-                (intptr_t) obj, (intptr_t) obj->mark(), Klass::cast(obj->klass())->external_name());
+                (void *) obj, (intptr_t) obj->mark(), obj->klass()->external_name());
        }
      }
 
@@ -1610,11 +1643,6 @@ void ObjectSynchronizer::release_monitors_owned_by_thread(TRAPS) {
 // Non-product code
 
 #ifndef PRODUCT
-
-void ObjectSynchronizer::trace_locking(Handle locking_obj, bool is_compiled,
-                                       bool is_method, bool is_locking) {
-  // Don't know what to do here
-}
 
 // Verify all monitors in the monitor cache, the verification is weak.
 void ObjectSynchronizer::verify() {
