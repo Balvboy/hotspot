@@ -254,7 +254,12 @@ static BiasedLocking::Condition revoke_bias(oop obj, bool allow_rebias, bool is_
   return BiasedLocking::BIAS_REVOKED;
 }
 
-
+ //enum HeuristicsResult {
+ //    HR_NOT_BIASED    = 1,  不需要偏向
+ //    HR_SINGLE_REVOKE = 2,  单个撤销
+ //    HR_BULK_REBIAS   = 3,  批量重偏向
+ //    HR_BULK_REVOKE   = 4   批量撤销
+  // };
 enum HeuristicsResult {
   HR_NOT_BIASED    = 1,
   HR_SINGLE_REVOKE = 2,
@@ -585,7 +590,7 @@ BiasedLocking::Condition BiasedLocking::revoke_and_rebias(Handle obj, bool attem
       }
     }
   }
-  //获取对象当前状态
+  
   HeuristicsResult heuristics = update_heuristics(obj(), attempt_rebias);
   if (heuristics == HR_NOT_BIASED) {
     return NOT_BIASED;
